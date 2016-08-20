@@ -3,6 +3,9 @@ use "files"
 use "capsicum"
 use "collections"
 
+primitive _ENOENT
+  fun apply(): I32 => 2
+
 actor Main is TestList
   new create(env: Env) => PonyTest(env, this)
   new make() => None
@@ -14,6 +17,8 @@ actor Main is TestList
     test(_TestExpect)
     test(_TestWritevOrdering)
     test(_TestPrintvOrdering)
+    test(_TestChDir)
+    test(_TestFailedChDir)
 
 class iso _TestStdinStdout is UnitTest
   fun name(): String =>
@@ -21,7 +26,7 @@ class iso _TestStdinStdout is UnitTest
 
   fun apply(h: TestHelper) =>
     let notifier: ProcessNotify iso = _ProcessClient("one, two, three",
-      "", 0, h)
+      "", 0, None, h)
     try
       let path = FilePath(h.env.root as AmbientAuth, "/bin/cat")
       let args: Array[String] iso = recover Array[String](1) end
@@ -48,7 +53,7 @@ class iso _TestStderr is UnitTest
 
   fun apply(h: TestHelper) =>
     let notifier: ProcessNotify iso = _ProcessClient("",
-      "cat: file_does_not_exist: No such file or directory\n", 1, h)
+      "cat: file_does_not_exist: No such file or directory\n", 1, None, h)
     try
       let path = FilePath(h.env.root as AmbientAuth, "/bin/cat")
       let args: Array[String] iso = recover Array[String](2) end
@@ -75,7 +80,7 @@ class iso _TestFileExec is UnitTest
 
   fun apply(h: TestHelper) =>
     let notifier: ProcessNotify iso = _ProcessClient("",
-      "cat: file_does_not_exist: No such file or directory\n", 1, h)
+      "cat: file_does_not_exist: No such file or directory\n", 1, CapError, h)
     try
       let path = FilePath(h.env.root as AmbientAuth, "/bin/date",
         recover val FileCaps.all().unset(FileExec) end)
@@ -147,7 +152,7 @@ class iso _TestWritevOrdering is UnitTest
 
   fun apply(h: TestHelper) =>
     let notifier: ProcessNotify iso = _ProcessClient("onetwothree",
-      "", 0, h)
+      "", 0, None, h)
     try
       let path = FilePath(h.env.root as AmbientAuth, "/bin/cat")
       let args: Array[String] iso = recover Array[String](1) end
@@ -179,7 +184,7 @@ class iso _TestPrintvOrdering is UnitTest
 
   fun apply(h: TestHelper) =>
     let notifier: ProcessNotify iso = _ProcessClient("one\ntwo\nthree\n",
-      "", 0, h)
+      "", 0, None, h)
     try
       let path = FilePath(h.env.root as AmbientAuth, "/bin/cat")
       let args: Array[String] iso = recover Array[String](1) end
@@ -205,6 +210,54 @@ class iso _TestPrintvOrdering is UnitTest
   fun timed_out(h: TestHelper) =>
     h.complete(false)
 
+class iso _TestChDir is UnitTest
+  fun name(): String =>
+    "process/ChDir"
+
+  fun apply(h: TestHelper) =>
+    let notifier: ProcessNotify iso = _ProcessClient("/bin\n", "", 0, None, h)
+    try
+      let path = FilePath(h.env.root as AmbientAuth, "/bin/pwd")
+      let args: Array[String] iso = recover Array[String](1) end
+      args.push("pwd")
+      let vars: Array[String] iso = recover Array[String](2) end
+      vars.push("HOME=/")
+      vars.push("PATH=/bin")
+      let workingdir = FilePath(h.env.root as AmbientAuth, "/bin")
+      let pm: ProcessMonitor = ProcessMonitor(consume notifier, path,
+        consume args, consume vars, workingdir)
+        h.long_test(5_000_000_000)
+    else
+      h.fail("Could not create FilePath!")
+    end
+
+  fun timed_out(h: TestHelper) =>
+    h.complete(false)
+
+class iso _TestFailedChDir is UnitTest
+  fun name(): String =>
+    "process/FailedChDir"
+
+  fun apply(h: TestHelper) =>
+    let notifier: ProcessNotify iso = _ProcessClient("", "", 255, ChildError(_ENOENT()), h)
+    try
+      let path = FilePath(h.env.root as AmbientAuth, "/bin/pwd")
+      let args: Array[String] iso = recover Array[String](1) end
+      args.push("pwd")
+      let vars: Array[String] iso = recover Array[String](2) end
+      vars.push("HOME=/")
+      vars.push("PATH=/bin")
+      let workingdir = FilePath(h.env.root as AmbientAuth, "/this_folder_mustnot_exists")
+      let pm: ProcessMonitor = ProcessMonitor(consume notifier, path,
+        consume args, consume vars, workingdir)
+        h.long_test(5_000_000_000)
+    else
+      h.fail("Could not create FilePath!")
+    end
+
+  fun timed_out(h: TestHelper) =>
+    h.complete(false)
+
 class _ProcessClient is ProcessNotify
   """
   Notifications for Process connections.
@@ -212,15 +265,17 @@ class _ProcessClient is ProcessNotify
   let _out: String
   let _err: String
   let _exit_code: I32
+  let _process_err: (None | ProcessError)
   let _h: TestHelper
   let _d_stdout: String ref = String
   let _d_stderr: String ref = String
 
   new iso create(out: String, err: String, exit_code: I32,
-    h: TestHelper) =>
+    process_err: (None | ProcessError), h: TestHelper) =>
     _out = out
     _err = err
     _exit_code = exit_code
+    _process_err = process_err
     _h = h
 
   fun ref stdout(process: ProcessMonitor ref, data: Array[U8] iso) =>
@@ -240,21 +295,37 @@ class _ProcessClient is ProcessNotify
     ProcessMonitor calls this if we run into errors with the
     forked process.
     """
-    match err
-    | ExecveError   => _h.fail("ProcessError: ExecveError")
-    | PipeError     => _h.fail("ProcessError: PipeError")
-    | Dup2Error     => _h.fail("ProcessError: Dup2Error")
-    | ForkError     => _h.fail("ProcessError: ForkError")
-    | FcntlError    => _h.fail("ProcessError: FcntlError")
-    | WaitpidError  => _h.fail("ProcessError: WaitpidError")
-    | CloseError    => _h.fail("ProcessError: CloseError")
-    | ReadError     => _h.fail("ProcessError: ReadError")
-    | WriteError    => _h.fail("ProcessError: WriteError")
-    | KillError     => _h.fail("ProcessError: KillError")
-    | Unsupported   => _h.fail("ProcessError: Unsupported")
-    | CapError      => _h.complete(true) // used in _TestFileExec
+    match _process_err
+    | let e: ProcessError =>
+      match e
+      | let expect_child_error: ChildError =>
+        match err
+        | let actual_child_error: ChildError =>
+          _h.assert_eq[I32](actual_child_error.errno, expect_child_error.errno)
+        else _h.fail("Assert err eq failed: expecting a child error but an actual one")
+        end
+      else _h.assert_true(e is err)
+      end
+      _h.complete(true)
     else
-      _h.fail("Unknown ProcessError!")
+      match err
+      | ExecveError       => _h.fail("ProcessError: ExecveError")
+      | PipeError         => _h.fail("ProcessError: PipeError")
+      | Dup2Error         => _h.fail("ProcessError: Dup2Error")
+      | ForkError         => _h.fail("ProcessError: ForkError")
+      | FcntlError        => _h.fail("ProcessError: FcntlError")
+      | WaitpidError      => _h.fail("ProcessError: WaitpidError")
+      | CloseError        => _h.fail("ProcessError: CloseError")
+      | ReadError         => _h.fail("ProcessError: ReadError")
+      | WriteError        => _h.fail("ProcessError: WriteError")
+      | KillError         => _h.fail("ProcessError: KillError")
+      | Unsupported       => _h.fail("ProcessError: Unsupported")
+      | ChdirError        => _h.fail("ProcessError: ChdirError")
+      | CapError          => _h.fail("ProcessError: CapError")
+      | let e: ChildError => _h.fail("ProcessError: ChildError " + e.errno.string())
+      else
+        _h.fail("Unknown ProcessError!")
+      end
     end
 
   fun ref dispose(process: ProcessMonitor ref, child_exit_code: I32) =>
@@ -269,4 +340,3 @@ class _ProcessClient is ProcessNotify
     _h.assert_eq[String box](_err, _d_stderr)
     _h.assert_eq[I32](_exit_code, child_exit_code)
     _h.complete(true)
-

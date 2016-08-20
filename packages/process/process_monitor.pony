@@ -112,6 +112,9 @@ primitive _STDOUTFILENO
 primitive _STDERRFILENO
   fun apply(): U32 => 2
 
+primitive _ERRNOFILENO
+  fun apply(): U32 => 3
+
 primitive _FSETFL
   fun apply(): I32 => 4
 
@@ -154,6 +157,11 @@ primitive WriteError
 primitive KillError
 primitive Unsupported // we throw this on non POSIX systems
 primitive CapError
+primitive ChdirError
+
+class val ChildError
+  let errno: I32
+  new val create(errno': I32) => errno = errno'
 
 type ProcessError is
   ( ExecveError
@@ -168,6 +176,8 @@ type ProcessError is
   | WaitpidError
   | WriteError
   | CapError
+  | ChdirError
+  | ChildError
   )
 
 actor ProcessMonitor
@@ -179,6 +189,7 @@ actor ProcessMonitor
 
   var _stdout_event: AsioEventID = AsioEvent.none()
   var _stderr_event: AsioEventID = AsioEvent.none()
+  var _errno_event: AsioEventID = AsioEvent.none()
 
   let _max_size: USize = 4096
   var _read_buf: Array[U8] iso = recover Array[U8].undefined(_max_size) end
@@ -191,14 +202,18 @@ actor ProcessMonitor
   var _stdout_write: U32 = -1
   var _stderr_read:  U32 = -1
   var _stderr_write: U32 = -1
+  var _errno_read:  U32 = -1
+  var _errno_write: U32 = -1
 
   var _stdout_open: Bool = true
   var _stderr_open: Bool = true
+  var _errno_open: Bool = true
 
   var _closed: Bool = false
 
   new create(notifier: ProcessNotify iso, filepath: FilePath,
-    args: Array[String] val, vars: Array[String] val)
+    args: Array[String] val, vars: Array[String] val,
+    workingdir: (FilePath | None) = None)
   =>
     """
     Create infrastructure to communicate with a forked child process
@@ -216,11 +231,13 @@ actor ProcessMonitor
         (_stdin_read, _stdin_write)   = _make_pipe(_FDCLOEXEC())
         (_stdout_read, _stdout_write) = _make_pipe(_FDCLOEXEC())
         (_stderr_read, _stderr_write) = _make_pipe(_FDCLOEXEC())
+        (_errno_read, _errno_write) = _make_pipe(_FDCLOEXEC())
         // Set O_NONBLOCK only for parent-side file descriptors, as many
         // programs (like cat) cannot handle a non-blocking stdin/stdout/stderr
         _set_fl(_stdin_write, _ONONBLOCK())
         _set_fl(_stdout_read, _ONONBLOCK())
         _set_fl(_stderr_read, _ONONBLOCK())
+        _set_fl(_errno_read, _ONONBLOCK())
       else
         _close_fd(_stdin_read)
         _close_fd(_stdin_write)
@@ -228,6 +245,8 @@ actor ProcessMonitor
         _close_fd(_stdout_write)
         _close_fd(_stderr_read)
         _close_fd(_stderr_write)
+        _close_fd(_errno_read)
+        _close_fd(_errno_write)
         _notifier.failed(this, PipeError)
         return
       end
@@ -239,7 +258,7 @@ actor ProcessMonitor
       _child_pid = @fork[I32]()
       match _child_pid
       | -1  => _notifier.failed(this, ForkError)
-      | 0   => _child(filepath.path, argp, envp)
+      | 0   => _child(workingdir, filepath.path, argp, envp)
       else
         _parent()
       end
@@ -250,18 +269,26 @@ actor ProcessMonitor
     end
     _notifier.created(this)
 
-  fun _child(path: String, argp: Array[Pointer[U8] tag],
+  fun ref _child(workingdir: (FilePath | None), path: String, argp: Array[Pointer[U8] tag],
     envp: Array[Pointer[U8] tag])
     =>
     """
-    We are now in the child process. We redirect STDIN, STDOUT and STDERR
-    to their pipes and execute the command. The command is executed via
-    execve which does not return on success, and the text, data, bss, and
-    stack of the calling process are overwritten by that of the program
-    loaded. We've set the FD_CLOEXEC flag on all file descriptors to ensure
-    that they are all closed automatically once @execve gets called.
+    We are now in the child process. We redirect STDIN, STDOUT and STDERR to
+    their pipes, change the working directory if any was specified and execute
+    the command. The command is executed via execve which does not return on
+    success, and the text, data, bss, and stack of the calling process are
+    overwritten by that of the program loaded. We've set the FD_CLOEXEC flag on
+    all file descriptors to ensure that they are all closed automatically once
+    @execve gets called.
     """
     ifdef posix then
+      // change the current directory, if any
+      match workingdir
+      | let dir: FilePath =>
+        if @chdir[I32](dir.path.null_terminated().cstring()) < 0 then
+          _child_exit_error(@pony_os_errno())
+        end
+      end
       _dup2(_stdin_read, _STDINFILENO())    // redirect stdin
       _dup2(_stdout_write, _STDOUTFILENO()) // redirect stdout
       _dup2(_stderr_write, _STDERRFILENO()) // redirect stderr
@@ -280,9 +307,11 @@ actor ProcessMonitor
     ifdef posix then
       _stdout_event = _create_asio_event(_stdout_read)
       _stderr_event = _create_asio_event(_stderr_read)
+      _errno_event = _create_asio_event(_errno_read)
       _close_fd(_stdin_read)
       _close_fd(_stdout_write)
       _close_fd(_stderr_write)
+      _close_fd(_errno_write)
     end
 
   fun _make_argv(args: Array[String] box): Array[Pointer[U8] tag] =>
@@ -297,7 +326,7 @@ actor ProcessMonitor
     argv.push(Pointer[U8]) // nullpointer to terminate list of args
     argv
 
-  fun _dup2(oldfd: U32, newfd: U32) =>
+  fun ref _dup2(oldfd: U32, newfd: U32) =>
     """
     Creates a copy of the file descriptor oldfd using the file
     descriptor number specified in newfd. If the file descriptor newfd
@@ -306,13 +335,20 @@ actor ProcessMonitor
     """
     ifdef posix then
       while (@dup2[I32](oldfd, newfd) < 0) do
-        if @pony_os_errno() == _EINTR() then
+        let errno = @pony_os_errno()
+        if errno == _EINTR() then
           continue
         else
-          @_exit[None](I32(-1))
+          _child_exit_error(errno)
         end
       end
     end
+
+  fun ref _child_exit_error(errno': I32) =>
+    var errno = errno'
+    @write[I32](_errno_write, addressof errno, USize(4))
+    _close_fd(_errno_write)
+    @_exit[None](I32(-1))
 
   fun _make_pipe(fd_flags: I32): (U32, U32) ? =>
     """
@@ -489,6 +525,13 @@ actor ProcessMonitor
         @pony_asio_event_destroy(event)
         _stderr_event = AsioEvent.none()
       end
+    | _errno_event =>
+      if AsioEvent.readable(flags) then
+        _errno_open = _pending_reads(_errno_read)
+      elseif AsioEvent.disposable(flags) then
+        @pony_asio_event_destroy(event)
+        _errno_event = AsioEvent.none()
+      end
     end
     _try_shutdown()
 
@@ -504,6 +547,8 @@ actor ProcessMonitor
     | _stdout_write => _stdout_write = -1
     | _stderr_read  => _stderr_read  = -1
     | _stderr_write => _stderr_write = -1
+    | _errno_read  => _errno_read  = -1
+    | _errno_write => _errno_write = -1
     end
 
   fun ref _close() =>
@@ -519,10 +564,14 @@ actor ProcessMonitor
         _close_fd(_stdout_write)
         _close_fd(_stderr_read)
         _close_fd(_stderr_write)
+        _close_fd(_errno_read)
+        _close_fd(_errno_write)
         _stdout_open = false
         _stderr_open = false
+        _errno_open = false
         @pony_asio_event_unsubscribe(_stdout_event)
         @pony_asio_event_unsubscribe(_stderr_event)
+        @pony_asio_event_unsubscribe(_errno_event)
         // We want to capture the exit status of the child
         var wstatus: I32 = 0
         let options: I32 = 0
@@ -582,6 +631,8 @@ actor ProcessMonitor
           end
         | _stderr_read =>
           _notifier.stderr(this, consume data)
+        | _errno_read =>
+          _handle_child_errno(consume data)
         end
 
         _read_len = 0
@@ -606,6 +657,16 @@ actor ProcessMonitor
       _read_buf.undefined(_max_size)
     end
 
+  fun ref _handle_child_errno(data: Array[U8] iso) =>
+    if data.size() == 4 then
+      // we expect the errno to be send in one frame
+      try
+        let errno: I32 = (data(0).i32() << 0) + (data(1).i32() << 8)
+                         + (data(2).i32() << 16) + (data(3).i32() << 24)
+        _notifier.failed(this, ChildError(errno))
+      end
+    end
+
   be _read_again(fd: U32) =>
     """
     Resume reading on file descriptor.
@@ -613,4 +674,5 @@ actor ProcessMonitor
     match fd
     | _stdout_read => _stdout_open = _pending_reads(fd)
     | _stderr_read => _stderr_open = _pending_reads(fd)
+    | _errno_read => _errno_open = _pending_reads(fd)
     end

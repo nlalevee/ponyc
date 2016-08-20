@@ -10,6 +10,7 @@ All notable changes to the Pony compiler and standard library will be documented
 ### Added
 
 - read_until method on buffered.Reader (RFC 0013)
+- add the possibility to set the working directory for the launched process.
 
 ### Changed
 
